@@ -1,8 +1,9 @@
 #include <cmath>
-#include <cstdlib>
-#include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <vector>
+#include <thread>
+#include <atomic>
 
 struct Vec
 {
@@ -49,7 +50,6 @@ struct Camera
         return { eye, ray_dir };
     }
 };
-
 
 enum Interaction { DIFF, SPEC, REFR };
 
@@ -109,7 +109,7 @@ Vec Radiance(const Ray &r, int depth, unsigned short *Xi)
     Vec x = r.o + r.d * t, n = (x - obj.p).norm(), nl = n.dot(r.d) < 0 ? n : n * -1, f = obj.c;
     // russian roulette
     double p = f.x > f.y && f.x > f.z ? f.x : f.y > f.z ? f.y : f.z;
-    if (++depth > 5) if (erand48(Xi) < p) f = f * (1 / p); else return obj.e;
+    if (++depth > 5) { if (erand48(Xi) < p) f = f * (1 / p); else return obj.e; }
 
     if (obj.interaction == DIFF)
     {
@@ -123,11 +123,11 @@ Vec Radiance(const Ray &r, int depth, unsigned short *Xi)
     Ray reflRay(x, r.d - n * 2 * n.dot(r.d)); // Ideal dielectric REFRACTION
     bool into = n.dot(nl) > 0;                // Ray from outside going in?
     double nc = 1, nt = 1.5, nnt = into ? nc / nt : nt / nc, ddn = r.d.dot(nl), cos2t;
-    if ((cos2t = 1 - nnt * nnt * (1 - ddn * ddn)) < 0)    // Total internal reflection
+    if ((cos2t = 1 - nnt * nnt * (1 - ddn * ddn)) < 0)// Total internal reflection
         return obj.e + f.mult(Radiance(reflRay, depth, Xi));
 
     Vec tdir = (r.d * nnt - n * ((into ? 1 : -1) * (ddn * nnt + std::sqrt(cos2t)))).norm();
-    double a = nt - nc, b = nt + nc, R0 = a * a/ (b * b), c = 1- (into ? - ddn : tdir.dot(n));
+    double a = nt - nc, b = nt + nc, R0 = a * a / (b * b), c = 1 - (into ? - ddn : tdir.dot(n));
     double Re = R0 + (1 - R0) * c * c * c * c * c, Tr = 1 - Re, P = .25 + .5 * Re, RP = Re / P, TP = Tr / (1 - P);
     return obj.e + f.mult(depth > 2 ? (erand48(Xi) < P ?   // Russian roulette
                         Radiance(reflRay, depth, Xi) * RP : Radiance(Ray(x, tdir), depth, Xi) * TP) :
@@ -139,28 +139,51 @@ int main(int argc, char** argv)
     int w = 512, h = 512, samples = argc == 2 ? std::stoi(argv[1]) : 1; // # samples
     Vec* c = new Vec[w * h];
     Camera cam(Vec(50,52,295.6), Vec(0,-0.042612,-1).norm(), Vec(0,1,0), 29, 512, 512);
-#pragma omp parallel for schedule(dynamic, 1)
-    for (int y = 0; y < h; y++) // rows
-    {
-        fprintf(stderr, "\rRendering (%d spp) %5.2f%%", samples, 100.0 * y / (h - 1));
-        for (unsigned short x = 0, Xi[3] = {0, 0, static_cast<unsigned short>(y * y * y)}; x < w; x++) // cols
-        {
-            Vec r(0, 0, 0);
-            for (int s = 0; s < samples; s++)
-            {
-                double r1 = erand48(Xi) - 0.5;
-                double r2 = erand48(Xi) - 0.5;
-                Ray ray = cam.GenerateRay(x + r1, y + r2);
-                ray.o = ray.o + ray.d * 140; // hack camera origin
-                r = r + Radiance(ray, 0, Xi) * (1.0 / samples);
-            }
+    std::vector<std::thread> workers; std::atomic<int> work_done;
+    unsigned worker_count = std::thread::hardware_concurrency();
+    unsigned worker_modulo = h % worker_count;
+    unsigned worker_height = h / worker_count;
+    unsigned worker_final_inc = worker_modulo ? h - worker_height * worker_count : 0;
+    unsigned min = 0; int total_paths = w * h;
 
-            auto i = static_cast<unsigned>(x + y * w);
-            c[i] = Vec(clamp(r.x), clamp(r.y), clamp(r.z));
-        }
+    for (unsigned short i = 0; i < worker_count; i++, min += worker_height)
+    {
+        auto max = i == worker_count - 1 ? min + worker_height + worker_final_inc : min + worker_height;
+        workers.emplace_back([min, max, w, samples, cam, c, &work_done]() {
+            unsigned pathCount = w * (max - min);
+            unsigned short Xi[3] = {0, 0, static_cast<unsigned short>(pathCount)};
+            for (unsigned pathId = 0; pathId < pathCount; pathId++)
+            {
+                unsigned x = pathId % w;
+                unsigned y = min + pathId / w;
+                Vec r(0, 0, 0);
+                for (int s = 0; s < samples; s++)
+                {
+                    double r1 = erand48(Xi) - 0.5;
+                    double r2 = erand48(Xi) - 0.5;
+                    Ray ray = cam.GenerateRay(x + r1, y + r2);
+                    ray.o = ray.o + ray.d * 140; // hack camera origin
+                    r = r + Radiance(ray, 0, Xi) * (1.0 / samples);
+                }
+
+                auto i = static_cast<unsigned>(x + y * w);
+                c[i] = Vec(clamp(r.x), clamp(r.y), clamp(r.z));
+                work_done++;
+            }
+        });
     }
 
-    std::ofstream str("image.ppm");
+    while (work_done < total_paths)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        fprintf(stdout, "Rendering: %5.2f %%\r", 100.0 * work_done / double(total_paths));
+        fflush(stdout);
+    }
+
+    for (auto& item : workers)
+        item.join();
+
+    std::cout << std::endl; std::ofstream str("image.ppm");
     str << "P3\n" << w << " " << h << std::endl << 255 << std::endl;
     for (int i = 0;  i< w * h; i++)
         str << toInt(c[i].x) << " " << toInt(c[i].y) << " " << toInt(c[i].z) << " ";

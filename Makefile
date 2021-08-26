@@ -1,2 +1,2 @@
 all:
-	g++ -std=c++14 -O3 -fopenmp main.cpp -o pt 
+	g++ -std=c++17 -O3 -Wall -Wextra -pedantic -pthread main.cpp -o pt
